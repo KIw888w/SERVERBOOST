@@ -1,0 +1,19 @@
+{
+  "name": "melody-boost-discord-bot",
+  "version": "1.0.0",
+  "description": "บอทดิสคอร์ดสำหรับสั่งบูสต์ผ่าน Melody Boost API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.6.1",
+    "promptpay-qr": "^0.5.0",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.35.5"
+  }
+}
