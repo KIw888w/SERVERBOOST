@@ -177,6 +177,8 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
   };
 
   const logChannelId = (options.logChannelId || process.env.BOOST_LOG_CHANNEL_ID || '').trim() || null;
+  // ห้องที่ให้ส่งสลิป (ตั้งใน .env: BOOST_SLIP_CHANNEL_ID) ไม่ตั้งจะใช้ห้องเดิมที่ระบุในข้อความ
+  const slipChannelId = (options.slipChannelId || process.env.BOOST_SLIP_CHANNEL_ID || '').trim() || '1555927974455418900';
 
   const fmtBaht = (v) => `${Number(v).toLocaleString('th-TH')} บาท`;
   const pendingTopups = new Map(); // userId -> { amount, expiresAt }
@@ -213,7 +215,7 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
           `### ${EMOJI.SPARKLE}  Boost Discord Server Auto ${EMOJI.SPARKLE}`,
           '',
           `## ${EMOJI.WARN}  อ่านก่อนสั่งซื้อ  ${EMOJI.WARN}`,
-          
+          'อ่านรายละเอียดให้ครบก่อนสั่งซื้อ หากไม่เข้าใจหรือไม่แน่ใจ ให้สอบถามแอดมินก่อนสั่งซื้อ ',
           '<#1565033235757404381>',
           '',
           `${EMOJI.PROMPTPAY}  **พร้อมเพย์**   | ${EMOJI.TRUEMONEY}  **TrueMoney**`,
@@ -380,7 +382,7 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
         [
           '# 💳 โอนเงินผ่านพร้อมเพย์',
           qrOk ? '## 1️⃣ สแกน QR ด้านล่าง (ยอดถูกล็อกให้แล้ว)' : '## 1️⃣ โอนเงินให้ตรงยอดเป๊ะ',
-          '## 2️⃣ แนบรูปสลิปส่งในห้องนี้ <#1555927974455418900> ภายใน 3 นาที',
+          `## 2️⃣ แนบรูปสลิปส่งในห้องนี้ <#${slipChannelId}> ภายใน 3 นาที`,
           '## 3️⃣ ระบบตรวจสลิปด้วย SlipOK แล้วเติมเครดิตให้เอง',
         ].join('\n'),
       )
@@ -595,6 +597,7 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
   discordClient.on('messageCreate', async (message) => {
     try {
       if (message.author.bot) return;
+      if (message.channelId !== slipChannelId) return; // อ่านสลิปเฉพาะในห้องที่กำหนด
       const pending = pendingTopups.get(message.author.id);
       if (!pending) return;
       if (Date.now() > pending.expiresAt) {
