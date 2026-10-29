@@ -11,15 +11,32 @@ const path = require('path');
 
 const FONT_DIR = path.join(__dirname, 'fonts');
 const FC_DIR = path.join(os.tmpdir(), 'comet-fontconfig');
+
+// ฟอนต์ที่เจอในโฟลเดอร์ fonts/ (ไว้เช็กว่าอัปขึ้นโฮสต์ครบหรือยัง)
+let bundled = [];
+try {
+  bundled = fs.readdirSync(FONT_DIR).filter((f) => /\.(ttf|otf|ttc)$/i.test(f));
+} catch (_) {}
+console.log(`[promptpayQr] โฟลเดอร์ฟอนต์: ${FONT_DIR}`);
+console.log(`[promptpayQr] พบฟอนต์ ${bundled.length} ไฟล์: ${bundled.join(', ') || '(ไม่มี)'}`);
+
 try {
   fs.mkdirSync(path.join(FC_DIR, 'cache'), { recursive: true });
   const FC_FILE = path.join(FC_DIR, 'fonts.conf');
+  // รวมฟอนต์ของโปรเจกต์ + ฟอนต์ของระบบ เพื่อไม่ให้ตัวอังกฤษหาย
+  const dirs = [
+    FONT_DIR,
+    '/usr/share/fonts',
+    '/usr/local/share/fonts',
+    path.join(os.homedir(), '.fonts'),
+    path.join(os.homedir(), '.local/share/fonts'),
+  ];
   fs.writeFileSync(
     FC_FILE,
     `<?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
-  <dir>${FONT_DIR}</dir>
+${dirs.map((d) => `  <dir>${d}</dir>`).join('\n')}
   <cachedir>${path.join(FC_DIR, 'cache')}</cachedir>
 </fontconfig>`
   );
@@ -27,9 +44,6 @@ try {
   process.env.FONTCONFIG_PATH = FC_DIR;
 } catch (err) {
   console.error('[promptpayQr] ตั้งค่า fontconfig ไม่สำเร็จ:', err.message);
-}
-if (!fs.existsSync(FONT_DIR)) {
-  console.warn(`[promptpayQr] ไม่พบโฟลเดอร์ฟอนต์: ${FONT_DIR} (ภาษาไทยจะแสดงเป็นกล่อง)`);
 }
 // ==================================================================
 
