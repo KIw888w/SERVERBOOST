@@ -44,7 +44,7 @@ const SHOP_FOOTER = '⇢ ˗ˏˋ ℂ𝕆𝕄𝔼𝕋 ℕ𝔼𝕎 ࿐ྂ';
 const SLIP_CHANNEL_ID = '1555927974455418900';
 const STATUS_CHANNEL_ID = '1565009038733877369';
 // แจ้งเตือนเมื่อสต็อกบูสต์ถึงเกณฑ์ (ปิง role ในห้องนี้)
-const STOCK_ALERT_CHANNEL_ID = '1554881839422906489';
+const STOCK_ALERT_CHANNEL_ID = '1565691050608164994';
 const STOCK_ALERT_ROLE_ID = '1555146265958944878';
 const STOCK_ALERT_MIN = 150;
 /** Custom emoji สำหรับ embed/ปุ่ม — อย่าใส่ใน modal title (ลิมิต Discord 45 ตัวอักษร) */
