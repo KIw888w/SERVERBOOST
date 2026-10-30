@@ -43,6 +43,10 @@ const SHOP_FOOTER = '⇢ ˗ˏˋ ℂ𝕆𝕄𝔼𝕋 ℕ𝔼𝕎 ࿐ྂ';
 // ห้องตรวจสลิป (ตรวจเฉพาะห้องนี้เท่านั้น) และห้องแสดงหน้าสรุปสถานะบูสต์
 const SLIP_CHANNEL_ID = '1555927974455418900';
 const STATUS_CHANNEL_ID = '1565009038733877369';
+// แจ้งเตือนเมื่อสต็อกบูสต์ถึงเกณฑ์ (ปิง role ในห้องนี้)
+const STOCK_ALERT_CHANNEL_ID = '1554881839422906489';
+const STOCK_ALERT_ROLE_ID = '1555146265958944878';
+const STOCK_ALERT_MIN = 150;
 /** Custom emoji สำหรับ embed/ปุ่ม — อย่าใส่ใน modal title (ลิมิต Discord 45 ตัวอักษร) */
 const EMOJI = {
   BOOST_AUTO: '<:1432612004434284626:1564569526492991569>',
@@ -406,6 +410,15 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
     lastShopSig = null; // บังคับให้รอบถัดไปเทียบใหม่
   }
 
+  // แคชผลสต็อกช่วงสั้น ๆ ให้ระบบอัปเดตหน้าร้านกับระบบแจ้งเตือนใช้ร่วมกัน (ลดจำนวนคำขอ)
+  let stockCache = { at: 0, data: null };
+  async function getStockCached(maxAgeMs = 20_000) {
+    if (stockCache.data && Date.now() - stockCache.at < maxAgeMs) return stockCache.data;
+    const data = await melodyService.client.stock();
+    stockCache = { at: Date.now(), data };
+    return data;
+  }
+
   let lastShopSig = null;
   let refreshingShop = false;
   async function refreshShops(reason) {
@@ -414,7 +427,7 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
     try {
       let stock;
       try {
-        stock = await melodyService.client.stock();
+        stock = await getStockCached(5000);
       } catch (err) {
         console.error('[customer-shop] อัปเดตหน้าร้าน: ดึงสต็อกไม่ได้:', err && err.message);
         return; // ดึงไม่ได้ = ไม่แก้ข้อความ (กันขึ้น "ไม่ทราบ")
@@ -464,6 +477,110 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
   else {
     discordClient.once('ready', startShopRefresh);
     discordClient.once('clientReady', startShopRefresh);
+  }
+
+  // ---------- แจ้งเตือนเมื่อสต็อกบูสต์ถึงเกณฑ์ (ครั้งเดียวต่อรอบที่สต็อกขึ้นไปถึง/เกินเกณฑ์) ----------
+  const alertStateFile = path.join(path.dirname(walletFile), 'stock_alert_state.json');
+  let alertState = { '1m': false, '3m': false };
+  try {
+    const raw = JSON.parse(require('fs').readFileSync(alertStateFile, 'utf8'));
+    for (const t of CUSTOMER_TIERS) alertState[t] = Boolean(raw && raw[t]);
+  } catch {
+    /* ยังไม่มีไฟล์ = ยังไม่เคยแจ้ง */
+  }
+  function saveAlertState() {
+    try {
+      const fs = require('fs');
+      const tmp = `${alertStateFile}.tmp`;
+      fs.mkdirSync(path.dirname(alertStateFile), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(alertState, null, 2));
+      fs.renameSync(tmp, alertStateFile);
+    } catch (err) {
+      console.error('[customer-shop] บันทึกสถานะแจ้งเตือนสต็อกไม่ได้:', err && err.message);
+    }
+  }
+  let checkingAlert = false;
+  async function checkStockAlert() {
+    if (checkingAlert) return;
+    checkingAlert = true;
+    try {
+      let stock;
+      try {
+        stock = await getStockCached(20_000);
+      } catch (err) {
+        console.error('[customer-shop] เช็กสต็อกเพื่อแจ้งเตือนไม่ได้:', err && err.message);
+        return;
+      }
+      if (!stock || typeof stock !== 'object') return;
+      const counts = {};
+      const newly = [];
+      let changed = false;
+      for (const t of CUSTOMER_TIERS) {
+        const n = toInt(stock[`boosts_${t}_available`]);
+        counts[t] = n;
+        if (n === null) continue; // ไม่รู้ค่า = ไม่เปลี่ยนสถานะ
+        if (n >= STOCK_ALERT_MIN) {
+          if (!alertState[t]) {
+            alertState[t] = true;
+            newly.push(t);
+            changed = true;
+          }
+        } else if (alertState[t]) {
+          alertState[t] = false; // สต็อกลดต่ำกว่าเกณฑ์แล้ว รอบหน้าที่กลับขึ้นไปค่อยแจ้งใหม่
+          changed = true;
+        }
+      }
+      if (newly.length === 0) {
+        if (changed) saveAlertState();
+        return;
+      }
+      const embed = new EmbedBuilder()
+        .setColor(0x57f287)
+        .setDescription(
+          [
+            '# 📦 สต็อกบูสต์เติมแล้ว',
+            `สต็อกถึง **${STOCK_ALERT_MIN}** บูสต์ขึ้นไปแล้ว พร้อมเปิดขาย`,
+            '',
+            ...CUSTOMER_TIERS.map(
+              (t) => `• **บูสต์ ${TIER_LABEL[t]} :** ${mono(counts[t] === null ? 'ไม่ทราบ' : `${counts[t].toLocaleString('th-TH')} บูสต์`)}${newly.includes(t) ? ' ✅' : ''}`,
+            ),
+          ].join('\n'),
+        )
+        .setFooter({ text: SHOP_FOOTER, iconURL: shopFooterIconUrl || undefined })
+        .setTimestamp();
+      try {
+        const ch = await discordClient.channels.fetch(STOCK_ALERT_CHANNEL_ID);
+        if (!ch || !ch.isTextBased()) throw new Error('ห้องแจ้งเตือนสต็อกไม่ใช่ห้องข้อความ');
+        await ch.send({
+          content: `<@&${STOCK_ALERT_ROLE_ID}>`,
+          embeds: [embed],
+          allowedMentions: { roles: [STOCK_ALERT_ROLE_ID] },
+        });
+        saveAlertState();
+      } catch (err) {
+        // ส่งไม่สำเร็จ -> คืนสถานะ ให้ลองใหม่รอบถัดไป
+        for (const t of newly) alertState[t] = false;
+        console.error('[customer-shop] ส่งแจ้งเตือนสต็อกไม่ได้:', err && err.message);
+      }
+    } finally {
+      checkingAlert = false;
+    }
+  }
+  function startStockAlert() {
+    const timer = setInterval(() => checkStockAlert().catch(() => {}), shopRefreshSec * 1000);
+    if (timer.unref) timer.unref();
+    checkStockAlert().catch(() => {});
+  }
+  if (typeof discordClient.isReady === 'function' && discordClient.isReady()) startStockAlert();
+  else {
+    let alertStarted = false;
+    const once = () => {
+      if (alertStarted) return;
+      alertStarted = true;
+      startStockAlert();
+    };
+    discordClient.once('ready', once);
+    discordClient.once('clientReady', once);
   }
 
   // ---------- โพสต์หน้าร้าน (เฉพาะแอดมิน) ----------
