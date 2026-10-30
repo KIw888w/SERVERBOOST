@@ -303,8 +303,8 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
     }
   }
 
-  async function buildShopPayload() {
-    const stock = await fetchStock();
+  async function buildShopPayload(preloadedStock) {
+    const stock = preloadedStock || (await fetchStock());
     const boostedTotals = countBoostedTotals();
     const info = {};
     for (const t of CUSTOMER_TIERS) {
@@ -372,7 +372,98 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(select), rowActions] };
   }
   async function postShop(channel) {
-    return channel.send(await buildShopPayload());
+    const sent = await channel.send(await buildShopPayload());
+    registerShopMessage(channel.id, sent.id);
+    return sent;
+  }
+
+  // ---------- อัปเดตหน้าร้านอัตโนมัติ (สต็อกเปลี่ยน / มีคนบูสต์เสร็จ) ----------
+  const shopMsgFile = path.join(path.dirname(walletFile), 'shop_messages.json');
+  let shopMessages = [];
+  try {
+    const raw = JSON.parse(require('fs').readFileSync(shopMsgFile, 'utf8'));
+    if (Array.isArray(raw)) shopMessages = raw.filter((x) => x && x.channelId && x.messageId);
+  } catch {
+    /* ยังไม่มีไฟล์ = ยังไม่เคยโพสต์หน้าร้าน */
+  }
+  function saveShopMessages() {
+    try {
+      const fs = require('fs');
+      const tmp = `${shopMsgFile}.tmp`;
+      fs.mkdirSync(path.dirname(shopMsgFile), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(shopMessages, null, 2));
+      fs.renameSync(tmp, shopMsgFile);
+    } catch (err) {
+      console.error('[customer-shop] บันทึกรายการหน้าร้านไม่ได้:', err && err.message);
+    }
+  }
+  function registerShopMessage(channelId, messageId) {
+    if (!shopMessages.some((x) => x.messageId === messageId)) {
+      shopMessages.push({ channelId, messageId });
+      if (shopMessages.length > 20) shopMessages = shopMessages.slice(-20);
+      saveShopMessages();
+    }
+    lastShopSig = null; // บังคับให้รอบถัดไปเทียบใหม่
+  }
+
+  let lastShopSig = null;
+  let refreshingShop = false;
+  async function refreshShops(reason) {
+    if (refreshingShop || shopMessages.length === 0) return;
+    refreshingShop = true;
+    try {
+      let stock;
+      try {
+        stock = await melodyService.client.stock();
+      } catch (err) {
+        console.error('[customer-shop] อัปเดตหน้าร้าน: ดึงสต็อกไม่ได้:', err && err.message);
+        return; // ดึงไม่ได้ = ไม่แก้ข้อความ (กันขึ้น "ไม่ทราบ")
+      }
+      if (!stock || typeof stock !== 'object') return;
+      const totals = countBoostedTotals();
+      const sig = JSON.stringify([
+        CUSTOMER_TIERS.map((t) => [toInt(stock[`boosts_${t}_available`]), toInt(stock[`boosts_${t}_total`])]),
+        totals,
+        CUSTOMER_PRICE,
+      ]);
+      if (sig === lastShopSig) return; // ไม่มีอะไรเปลี่ยน ไม่ต้องแก้ข้อความ
+      const payload = await buildShopPayload(stock);
+      let allOk = true;
+      for (const entry of [...shopMessages]) {
+        try {
+          const ch = await discordClient.channels.fetch(entry.channelId);
+          await ch.messages.edit(entry.messageId, payload);
+        } catch (err) {
+          const code = err && err.code;
+          if (code === 10008 || code === 10003 || code === 50001) {
+            // ข้อความ/ห้องถูกลบ หรือบอทเข้าไม่ได้ -> เลิกอัปเดตอันนี้
+            shopMessages = shopMessages.filter((x) => x.messageId !== entry.messageId);
+            saveShopMessages();
+          } else {
+            allOk = false;
+            console.error('[customer-shop] แก้หน้าร้านไม่ได้:', err && err.message);
+          }
+        }
+      }
+      if (allOk) lastShopSig = sig;
+      if (reason) console.log(`[customer-shop] อัปเดตหน้าร้านแล้ว (${reason})`);
+    } finally {
+      refreshingShop = false;
+    }
+  }
+  const shopRefreshSec = Math.max(30, toInt(process.env.BOOST_SHOP_REFRESH_SEC) ?? 60);
+  let shopTimerStarted = false;
+  function startShopRefresh() {
+    if (shopTimerStarted) return;
+    shopTimerStarted = true;
+    const timer = setInterval(() => refreshShops('สต็อก/ยอดบูสต์เปลี่ยน').catch(() => {}), shopRefreshSec * 1000);
+    if (timer.unref) timer.unref();
+    refreshShops().catch(() => {}); // เทียบครั้งแรกทันทีหลังบอทออนไลน์
+  }
+  if (typeof discordClient.isReady === 'function' && discordClient.isReady()) startShopRefresh();
+  else {
+    discordClient.once('ready', startShopRefresh);
+    discordClient.once('clientReady', startShopRefresh);
   }
 
   // ---------- โพสต์หน้าร้าน (เฉพาะแอดมิน) ----------
@@ -971,6 +1062,7 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
 
     const state = complete ? 'completed' : applied > 0 ? 'partial' : 'failed';
     await updateStatus(state, { applied, requested, before: snap.boosts_before ?? null, after: snap.boosts_after ?? null });
+    refreshShops('มีออเดอร์บูสต์เสร็จ').catch(() => {}); // หน้าร้านอัปเดตสต็อก/ยอดบูสต์ทันที
 
     // ข้อความถึงลูกค้า (เห็นเฉพาะคนสั่ง) — ไม่มีข้อมูลเทคนิค
     const statusLabel = { completed: 'สำเร็จ', partial: 'สำเร็จบางส่วน', failed: 'ไม่สำเร็จ' }[state];
