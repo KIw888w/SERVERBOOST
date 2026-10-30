@@ -541,6 +541,7 @@ function createService(client, store, opts = {}) {
     lookup,
     get: (ref) => store.get(ref),
     unresolved: () => store.list().filter(isUnresolved),
+    list: () => store.list(),
     isTracking: (ref) => trackingNow.has(ref),
     client,
   };
