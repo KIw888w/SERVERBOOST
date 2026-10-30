@@ -278,6 +278,59 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
     message.delete().catch(() => {}); // ลบข้อความคำสั่ง (ต้องมีสิทธิ์ Manage Messages ถ้าไม่มีจะข้าม)
   });
 
+  // ---------- แอดมินเติมเครดิตให้ลูกค้าเอง: !addcredit @คน 100 [หมายเหตุ] ----------
+  discordClient.on('messageCreate', async (message) => {
+    try {
+      if (message.author.bot) return;
+      const m = message.content.trim().match(/^!(addcredit|เติมเครดิต)\s+(?:<@!?(\d{15,25})>|(\d{15,25}))\s+([\d,]+(?:\.\d{1,2})?)(?:\s+([\s\S]+))?$/i);
+      if (!/^!(addcredit|เติมเครดิต)(\s|$)/i.test(message.content.trim())) return;
+      if (!isAdmin(message.member, message.author.id)) return;
+      if (!m) {
+        await message.reply('⚠️ ใช้แบบนี้: `!addcredit @ลูกค้า 100 หมายเหตุ(ไม่ใส่ก็ได้)` หรือใช้ไอดีแทน @ ก็ได้').catch(() => {});
+        return;
+      }
+      const targetId = m[2] || m[3];
+      const amount = Math.round(Number(m[4].replace(/,/g, '')) * 100) / 100;
+      const note = (m[5] || '').trim().slice(0, 200);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) {
+        await message.reply('⚠️ จำนวนเงินไม่ถูกต้อง (ต้องมากกว่า 0 และไม่เกิน 100,000)').catch(() => {});
+        return;
+      }
+      let newBalance;
+      try {
+        newBalance = await withWalletLock(() =>
+          wallet.credit(targetId, amount, { source: 'admin', by: message.author.id, note: note || undefined }),
+        );
+      } catch (err) {
+        await message.reply(`⚠️ เติมเครดิตไม่สำเร็จ: ${err.message}`).catch(() => {});
+        return;
+      }
+      await message.reply({
+        content: `✅ เติมเครดิตให้ <@${targetId}> **+${fmtBaht(amount)}** แล้ว (คงเหลือ: **${fmtBaht(newBalance)}**)${note ? `\nหมายเหตุ: ${note}` : ''}`,
+        allowedMentions: { parse: [], repliedUser: false },
+      }).catch(() => {});
+
+      if (logChannelId) {
+        const logChannel = await discordClient.channels.fetch(logChannelId).catch(() => null);
+        if (logChannel && logChannel.isTextBased()) {
+          const logEmbed = new EmbedBuilder()
+            .setColor(0x3498db)
+            .setDescription([
+              '# 🛠️ แอดมินเติมเครดิต',
+              `**ผู้เติม:** <@${message.author.id}>`,
+              `**ผู้รับ:** <@${targetId}>`,
+              `**จำนวน:** ${fmtBaht(amount)} (คงเหลือ ${fmtBaht(newBalance)})`,
+              note ? `**หมายเหตุ:** ${note}` : '',
+            ].filter(Boolean).join('\n'))
+            .setTimestamp();
+          await logChannel.send({ embeds: [logEmbed], allowedMentions: { parse: [] } }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error('[customer-shop] addcredit error:', err);
+    }
+  });
+
   // ---------- เติมเครดิต: เลือกช่องทาง ----------
   const slipReady = Boolean(slipokApiKey && slipokBranchId);
   const truemoneyReady = Boolean(truemoneyNumber);
@@ -634,7 +687,7 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
 
   // ---------- กดส่งฟอร์มสั่งบูสต์ ----------
   async function handleOrderSubmit(interaction, tier) {
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true }); // เห็นเฉพาะคนสั่ง
     const userId = interaction.user.id;
     try {
       const input = validateOrderInput(
@@ -676,7 +729,10 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
           { name: 'เครดิตคงเหลือ', value: fmtBaht(debitRes.balance), inline: true },
         );
       await interaction.editReply({ embeds: [embed] });
-      const resultMsg = await interaction.fetchReply();
+      const resultMsg = {
+        // ข้อความ ephemeral แก้ผ่าน message.edit ไม่ได้ ต้องแก้ผ่าน interaction.editReply
+        edit: (text) => interaction.editReply(typeof text === 'string' ? { content: text, embeds: [] } : text),
+      };
       runCustomerOrder({ userId, draft, totalPrice, resultMsg, amount: input.amount, interaction });
     } catch (err) {
       await interaction.editReply(`⚠️ ${(err && err.message) || 'เกิดข้อผิดพลาด'}`);

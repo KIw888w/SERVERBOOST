@@ -48,7 +48,13 @@ async function redeemVoucher({ code, phone }) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Accept: 'application/json',
+        Accept: 'application/json, text/plain, */*',
+        // TrueMoney (Cloudflare) บล็อกคำขอที่ไม่มี header แบบเบราว์เซอร์ -> HTTP 403
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Origin: 'https://gift.truemoney.com',
+        Referer: `https://gift.truemoney.com/campaign/?v=${encodeURIComponent(code)}`,
+        'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8',
       },
       body: JSON.stringify({ mobile: phone, voucher_hash: code }),
       signal: AbortSignal.timeout(REDEEM_TIMEOUT_MS),
@@ -63,6 +69,10 @@ async function redeemVoucher({ code, phone }) {
   try {
     body = await res.json();
   } catch {
+    // 403/429 = โดน Cloudflare/ระบบกันบอทตัดก่อนถึงตัวซอง -> ไม่มีการรับซอง ไม่ถูกตัดเงินแน่นอน
+    if (res.status === 403 || res.status === 429) {
+      throw new Error(`TrueMoney บล็อกคำขอจากเซิร์ฟเวอร์บอท (HTTP ${res.status}) ซองยังไม่ถูกรับ ลองใหม่อีกครั้งหรือติดต่อแอดมิน`);
+    }
     const uncertain = new Error(`TrueMoney ตอบกลับไม่เป็น JSON (HTTP ${res.status})`);
     uncertain.uncertain = true;
     throw uncertain;

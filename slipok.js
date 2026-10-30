@@ -23,7 +23,15 @@ async function verifySlip({ apiKey, branchId, imageBuffer, amount }) {
 
   // สร้าง multipart/form-data ด้วย native FormData (Node 18+)
   const { Blob } = require('buffer');
-  const blob = new Blob([imageBuffer], { type: 'image/png' });
+  // แปลงเป็น PNG ก่อนส่ง (สลิปจากแอปบางตัว เช่น TrueMoney อาจเป็น webp/jpg/ขนาดใหญ่ ทำให้ SlipOK อ่าน QR ไม่ได้)
+  let pngBuffer = imageBuffer;
+  try {
+    const sharp = require('sharp');
+    pngBuffer = await sharp(imageBuffer).rotate().flatten({ background: '#ffffff' }).png().toBuffer();
+  } catch (err) {
+    console.error('[slipok] แปลงรูปเป็น PNG ไม่สำเร็จ ใช้ไฟล์เดิม:', err.message);
+  }
+  const blob = new Blob([pngBuffer], { type: 'image/png' });
 
   const form = new FormData();
   form.append('files', blob, 'slip.png');
@@ -53,7 +61,8 @@ async function verifySlip({ apiKey, branchId, imageBuffer, amount }) {
 
   if (!res.ok || !body.success) {
     const msg = body.message || body.msg || body.error || `HTTP ${res.status}`;
-    throw new Error(`SlipOK: ${msg}`);
+    console.error('[slipok] ตอบกลับผิดพลาด:', res.status, JSON.stringify(body));
+    throw new Error(`SlipOK: ${msg}${body.code ? ` (code ${body.code})` : ''}`);
   }
 
   const data = body.data || body;
