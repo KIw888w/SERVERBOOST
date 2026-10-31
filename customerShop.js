@@ -28,6 +28,7 @@
  *   🧧 TrueMoney — กดปุ่ม → วางลิงก์ซองของขวัญ → บอทรับซองเข้าเบอร์ร้าน → เติมอัตโนมัติ
  */
 const path = require('path');
+const crypto = require('crypto');
 const { WalletStore } = require('./wallet');
 const { verifySlip } = require('./slipok');
 const { promptPayQrPng } = require('./promptpayQr');
@@ -182,6 +183,26 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
     walletChain = run.catch(() => {});
     return run;
   };
+  // เติมเครดิตแบบลองซ้ำ (กันดิสก์สะดุดชั่วคราว) — ถ้า transRef ซ้ำจะไม่ลองใหม่
+  const creditWithRetry = async (uid, amt, meta, tries = 3) => {
+    let last;
+    for (let i = 0; i < tries; i++) {
+      try {
+        return await withWalletLock(() => wallet.credit(uid, amt, meta));
+      } catch (e) {
+        last = e;
+        if (e && e.code === 'DUPLICATE_REF') throw e;
+        await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+      }
+    }
+    throw last;
+  };
+  const bootTime = new Date().toISOString(); // รายการที่เกิดก่อนเวลานี้ = ค้างจากรอบก่อนที่บอทดับ
+  try {
+    wallet.selfCheck(); // เช็ค/กู้ไฟล์กระเป๋าตั้งแต่ตอนเริ่ม
+  } catch (e) {
+    console.error(`[customer-shop] 🚨 ไฟล์กระเป๋าเครดิตมีปัญหา: ${e.message} — ห้ามลบ/เขียนทับไฟล์ ให้ตรวจ/กู้ก่อน`);
+  }
 
   const logChannelId = (options.logChannelId || process.env.BOOST_LOG_CHANNEL_ID || '').trim() || null;
 
@@ -263,6 +284,39 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
       await ch.send({ embeds: [e], allowedMentions: { parse: [] } });
     } catch (err) {
       console.error('[customer-shop] ส่ง log ไม่ได้:', err && err.message);
+    }
+  }
+  // ---------- log การเติมเครดิต: ใคร เติมอะไร เท่าไหร่ ----------
+  const topupLogChannelId =
+    (options.topupLogChannelId || process.env.BOOST_TOPUP_LOG_CHANNEL_ID || '').trim() || '1565973316487872512';
+  const TOPUP_SOURCE_LABEL = { truemoney: '🧧 TrueMoney (ซองของขวัญ)', slipok: '💳 พร้อมเพย์ (สลิป)', admin: '🛠️ แอดมินเติมให้' };
+  async function logTopup({ userId, amount, balance, source, from, by, note, transRef, recovered = false }) {
+    try {
+      const ch = await discordClient.channels.fetch(topupLogChannelId).catch(() => null);
+      if (!ch || !ch.isTextBased()) {
+        console.error(`[customer-shop] ส่ง log เติมเครดิตไม่ได้: ไม่พบห้อง ${topupLogChannelId} หรือบอทไม่มีสิทธิ์`);
+        return;
+      }
+      let uname = '';
+      try {
+        const u = await discordClient.users.fetch(userId);
+        uname = u && u.username ? u.username : '';
+      } catch { /* ใช้แค่ mention */ }
+      const lines = [
+        `# 💰 เติมเครดิต${recovered ? ' (กู้หลังบอทเริ่มใหม่)' : ''}`,
+        `**ลูกค้า:** <@${userId}>${uname ? ` (${uname})` : ''} \`${userId}\``,
+        `**ช่องทาง:** ${TOPUP_SOURCE_LABEL[source] || source}`,
+        `**จำนวนที่เติม:** +${fmtBaht(amount)}`,
+        balance != null ? `**เครดิตคงเหลือ:** ${fmtBaht(balance)}` : '',
+        from && from !== 'ไม่ทราบ' ? `**เจ้าของซอง:** ${from}` : '',
+        by ? `**ผู้เติม:** <@${by}>` : '',
+        note ? `**หมายเหตุ:** ${note}` : '',
+        transRef ? `**อ้างอิง:** \`${transRef}\`` : '',
+      ].filter(Boolean);
+      const e = new EmbedBuilder().setColor(0x57f287).setDescription(lines.join('\n')).setFooter({ text: SHOP_FOOTER }).setTimestamp();
+      await ch.send({ embeds: [e], allowedMentions: { parse: [] } });
+    } catch (err) {
+      console.error('[customer-shop] ส่ง log เติมเครดิตไม่ได้:', err && err.message);
     }
   }
   // ข้อความ error ที่ลูกค้าเห็นได้ — ตัดคำเทคนิค/ชื่อผู้ให้บริการออก
@@ -626,6 +680,7 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
           allowedMentions: { parse: [], repliedUser: false },
         })
         .catch(() => {});
+      logTopup({ userId: targetId, amount, balance: newBalance, source: 'admin', by: message.author.id, note });
       await notifyAdmins(0x3498db, '🛠️ แอดมินเติมเครดิต', [
         `**ผู้เติม:** <@${message.author.id}>`,
         `**ผู้รับ:** <@${targetId}>`,
@@ -788,12 +843,35 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
       return;
     }
     redeemingNow.add(code);
+    const inflightId = `tm:${code}`;
     try {
+      // จดลงสมุดก่อนรับซองเสมอ — ถ้าจดไม่ได้จะไม่รับซอง (ซองลูกค้ายังไม่ถูกใช้)
+      try {
+        await withWalletLock(() => wallet.beginInflight(inflightId, { kind: 'truemoney', userId, code }));
+      } catch (err) {
+        console.error('[customer-shop] จดสมุดก่อนรับซองไม่ได้:', err.message);
+        await interaction.editReply('⚠️ ระบบบันทึกข้อมูลขัดข้อง ซองของคุณยังไม่ถูกใช้ ลองใหม่อีกครั้ง หรือติดต่อแอดมิน');
+        return;
+      }
       let voucher;
       try {
         voucher = await redeemVoucher({ code, phone: truemoneyNumber });
       } catch (err) {
+        // ถึงตรงนี้ = ไม่ได้เงินเข้า (หรือไม่แน่ใจ) ปิดรายการค้าง; กรณีไม่แน่ใจให้แจ้งแอดมินพร้อมโค้ดซองไว้ตรวจ
         if (err.uncertain) {
+          await notifyAdmins(0xe67e22, '⚠️ รับซอง TrueMoney: ผลไม่แน่ชัด (ต้องตรวจมือ)', [
+            `**ลูกค้า:** <@${userId}>`,
+            `**โค้ดซอง:** \`${code}\``,
+            `**รายละเอียด:** ${err.message}`,
+            'ถ้าเงินเข้า TrueMoney ร้านแล้ว ให้เติมให้ด้วย `!addcredit`',
+          ]);
+        }
+        await withWalletLock(() => wallet.endInflight(inflightId)).catch(() => {});
+        if (err.blocked) {
+          // โดน Cloudflare บล็อกก่อนถึงตัวซอง — ซองยังไม่ถูกใช้ แจ้งแอดมินผ่าน log
+          console.error(`[customer-shop] ⚠️ TrueMoney บล็อกบอท (HTTP ${err.httpStatus}) — ตั้ง TRUEMONEY_PROXY (proxy ไทย) หรือย้ายเซิร์ฟเวอร์ user=${userId}`);
+          await interaction.editReply(`⚠️ ${err.message}`);
+        } else if (err.uncertain) {
           // ไม่รู้ว่าเงินเข้าหรือยัง — ห้ามบอกว่าซองใช้ไม่ได้ และห้ามเติมเอง
           console.error(`[customer-shop] truemoney ผลไม่แน่ชัด user=${userId} code=${code}:`, err.message);
           await interaction.editReply(
@@ -805,20 +883,39 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
         return;
       }
 
+      // จดยอดที่ได้จริงลงสมุดทันที — ถ้าบอทดับก่อนเติมเครดิต เปิดใหม่จะเติมให้อัตโนมัติ
+      await withWalletLock(() =>
+        wallet.patchInflight(inflightId, { status: 'redeemed', amount: voucher.amount, ownerName: voucher.ownerName }),
+      ).catch((e) => console.error('[customer-shop] จดยอดซองลงสมุดไม่ได้:', e.message));
+
       let newBalance;
       try {
-        newBalance = await withWalletLock(() =>
-          wallet.credit(userId, voucher.amount, { transRef: `truemoney:${code}`, source: 'truemoney', from: voucher.ownerName }),
-        );
+        newBalance = await creditWithRetry(userId, voucher.amount, {
+          transRef: `truemoney:${code}`,
+          source: 'truemoney',
+          from: voucher.ownerName,
+          inflightId,
+        });
       } catch (err) {
-        // รับซองเข้าเบอร์ร้านแล้วแต่เติมเครดิตไม่สำเร็จ — ต้องให้แอดมินเติมมือ
         console.error(`[customer-shop] ⚠️ รับซองแล้วแต่เติมเครดิตพลาด user=${userId} amount=${voucher.amount} code=${code}:`, err.message);
+        if (err.code === 'DUPLICATE_REF') {
+          await withWalletLock(() => wallet.endInflight(inflightId)).catch(() => {});
+        } else {
+          await notifyAdmins(0xed4245, '🚨 รับซองแล้วแต่เติมเครดิตไม่สำเร็จ', [
+            `**ลูกค้า:** <@${userId}>`,
+            `**ยอด:** ${fmtBaht(voucher.amount)}`,
+            `**โค้ดซอง:** \`${code}\``,
+            `**สาเหตุ:** ${err.message}`,
+            'รายการถูกจดไว้แล้ว บอทจะเติมให้อัตโนมัติเมื่อเริ่มทำงานใหม่ (หรือเติมเองด้วย `!addcredit`)',
+          ]);
+        }
         await interaction.editReply(
-          `⚠️ รับซองสำเร็จ ${fmtBaht(voucher.amount)} แต่เติมเครดิตไม่สำเร็จ (${err.message}) — ติดต่อแอดมินพร้อมลิงก์ซองนี้`,
+          `⚠️ รับซองสำเร็จ ${fmtBaht(voucher.amount)} แต่เติมเครดิตไม่สำเร็จ (${err.message}) — ระบบบันทึกรายการไว้แล้ว ติดต่อแอดมินพร้อมลิงก์ซองนี้`,
         );
         return;
       }
 
+      logTopup({ userId, amount: voucher.amount, balance: newBalance, source: 'truemoney', from: voucher.ownerName, transRef: `truemoney:${code}` });
       const embed = new EmbedBuilder()
         .setColor(0x57f287)
         .setDescription(['# ✅ เติมเครดิตสำเร็จ', `## +${fmtBaht(voucher.amount)}`, `เครดิตคงเหลือ: **${fmtBaht(newBalance)}**`].join('\n'));
@@ -872,7 +969,8 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
         const amount = Number(cid.slice('cs:amt:'.length));
         if (!TOPUP_PRESETS.includes(amount)) return;
         startTopup(interaction.user.id, amount);
-        await interaction.update(await transferPayload(amount));
+        await interaction.deferUpdate(); // สร้าง QR อาจเกิน 3 วินาที ต้องรับ interaction ก่อน
+        await interaction.editReply(await transferPayload(amount));
         return;
       }
       // ระบุยอดเอง
@@ -888,7 +986,8 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
           return;
         }
         startTopup(interaction.user.id, amount);
-        await interaction.reply({ ...(await transferPayload(amount)), ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        await interaction.editReply(await transferPayload(amount));
         return;
       }
 
@@ -961,46 +1060,97 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
       if (message.author.bot) return;
       if (message.channelId !== slipChannelId) return;
       const uid = message.author.id;
+      const img = message.attachments.find(isImageAttachment);
       const pending = pendingTopups.get(uid);
-      if (!pending) return;
-      if (Date.now() > pending.expiresAt) {
-        pendingTopups.delete(uid);
+      const expired = pending && Date.now() > pending.expiresAt;
+      if (expired) pendingTopups.delete(uid);
+      // ส่งรูปโดยไม่ได้เลือกยอด/หมดเวลา -> ลบทิ้งทันที กันสลิปค้างให้คนอื่นเห็น (ยกเว้นแอดมิน)
+      if (img && (!pending || expired)) {
+        if (!isAdmin(message.member, uid)) message.delete().catch(() => {});
         return;
       }
-      const img = message.attachments.find(isImageAttachment);
-      if (!img) return;
-      if (slipBusy.has(uid)) return; // กำลังตรวจสลิปก่อนหน้าอยู่
+      if (!pending || !img) return;
+      if (slipBusy.has(uid)) {
+        message.delete().catch(() => {}); // ส่งซ้อนระหว่างตรวจอยู่ -> ลบทิ้ง
+        return;
+      }
       slipBusy.add(uid);
 
-      const processingMsg = await message.reply(`${EMOJI.LOADING}  กำลังตรวจสอบสลิป...`).catch(() => null);
+      // ใช้ channel.send (ไม่ reply) เพราะเราจะลบข้อความสลิปต้นทาง
+      const processingMsg = await message.channel.send(`<@${uid}> ${EMOJI.LOADING}  กำลังตรวจสอบสลิป...`).catch(() => null);
       const say = (payload) => {
-        const body = typeof payload === 'string' ? { content: payload, embeds: [] } : payload;
-        return processingMsg ? processingMsg.edit(body).catch(() => {}) : message.reply(body).catch(() => {});
+        const body =
+          typeof payload === 'string'
+            ? { content: `<@${uid}> ${payload}`, embeds: [] }
+            : { ...payload, content: `<@${uid}>` };
+        return processingMsg ? processingMsg.edit(body).catch(() => {}) : message.channel.send(body).catch(() => {});
       };
+      // ลบข้อความผลลัพธ์ของบอทหลังผ่านไป 30 วินาที (ไม่ให้ห้องรก/ไม่โชว์ยอดเงินค้างนาน)
+      const cleanupBotMsg = () => {
+        if (processingMsg) setTimeout(() => processingMsg.delete().catch(() => {}), 30_000).unref();
+      };
+      let slipInflightId = null;
+      let slipVerified = false;
       try {
         const res = await fetch(img.url, { signal: AbortSignal.timeout(20_000) });
         if (!res.ok) throw new Error(`โหลดรูปสลิปไม่สำเร็จ (HTTP ${res.status})`);
         const buf = Buffer.from(await res.arrayBuffer());
+        message.delete().catch(() => {}); // โหลดรูปแล้ว -> ลบสลิปออกจากห้องทันที (ต้องมีสิทธิ์ Manage Messages)
+        // จดลงสมุดก่อนส่งสลิปตรวจ — ถ้าบอทดับกลางทาง เปิดใหม่จะแจ้งแอดมิน/ลูกค้าให้ตรวจ
+        slipInflightId = `slip:${uid}:${Date.now()}`;
+        await withWalletLock(() => wallet.beginInflight(slipInflightId, { kind: 'slip', userId: uid, amount: pending.amount }));
         const data = await verifySlip({ apiKey: slipokApiKey, branchId: slipokBranchId, imageBuffer: buf, amount: pending.amount });
         const creditedAmount = toNumber(data.amount) ?? pending.amount;
         const transRef = data.transRef || null;
-        let newBalance;
-        try {
-          newBalance = await withWalletLock(() => wallet.credit(uid, creditedAmount, { transRef, source: 'slipok' }));
-        } catch (e) {
-          await say(`⚠️ ${String(e.message).replace(/\s*\(transRef:[^)]*\)/, '')}`);
+        if (!transRef) {
+          console.error('[customer-shop] ⚠️ SlipOK ไม่ส่ง transRef กลับมา ไม่เติมเครดิต (กันสลิปซ้ำไม่ได้) user=' + uid);
+          slipVerified = true; // ถึงขั้นนี้แล้วไม่ใช่ error ก่อนตรวจ
+          await withWalletLock(() => wallet.endInflight(slipInflightId)).catch(() => {});
+          await notifyAdmins(0xe67e22, '⚠️ สลิปผ่านแต่ไม่มีเลขอ้างอิง (ไม่เติมอัตโนมัติ)', [
+            `**ลูกค้า:** <@${uid}>`,
+            `**ยอดในสลิป:** ${fmtBaht(creditedAmount)}`,
+            'ตรวจบัญชีรับเงินแล้วเติมด้วย `!addcredit` ถ้าเงินเข้าจริง',
+          ]);
+          await say('⚠️ ยืนยันเลขอ้างอิงของสลิปไม่ได้ จึงยังไม่เติมเครดิตให้ กรุณาติดต่อแอดมิน');
           return;
         }
+        slipVerified = true;
+        await withWalletLock(() =>
+          wallet.patchInflight(slipInflightId, { status: 'verified', transRef, amount: creditedAmount }),
+        ).catch((e) => console.error('[customer-shop] จดสลิปที่ตรวจแล้วลงสมุดไม่ได้:', e.message));
+        let newBalance;
+        try {
+          newBalance = await creditWithRetry(uid, creditedAmount, { transRef, source: 'slipok', inflightId: slipInflightId });
+        } catch (e) {
+          if (e.code === 'DUPLICATE_REF') {
+            await withWalletLock(() => wallet.endInflight(slipInflightId)).catch(() => {});
+            await say(`⚠️ ${String(e.message).replace(/\s*\(transRef:[^)]*\)/, '')}`);
+          } else {
+            await notifyAdmins(0xed4245, '🚨 สลิปผ่านแล้วแต่เติมเครดิตไม่สำเร็จ', [
+              `**ลูกค้า:** <@${uid}>`,
+              `**ยอด:** ${fmtBaht(creditedAmount)}`,
+              `**transRef:** \`${transRef}\``,
+              `**สาเหตุ:** ${e.message}`,
+              'รายการถูกจดไว้แล้ว บอทจะเติมให้อัตโนมัติเมื่อเริ่มทำงานใหม่ (หรือเติมเองด้วย `!addcredit`)',
+            ]);
+            await say('⚠️ ตรวจสลิปผ่านแล้ว แต่เติมเครดิตไม่สำเร็จชั่วคราว ระบบบันทึกรายการไว้แล้ว กรุณาติดต่อแอดมิน');
+          }
+          return;
+        }
+        logTopup({ userId: uid, amount: creditedAmount, balance: newBalance, source: 'slipok', transRef });
         pendingTopups.delete(uid); // เติมสำเร็จแล้ว ใช้ได้ครั้งเดียวต่อการเลือกยอด
         const done = new EmbedBuilder()
           .setColor(0x57f287)
           .setDescription([`# ${EMOJI.SUCCESS}  เติมเครดิตเสร็จสิ้น`, `## +${fmtBaht(creditedAmount)}`, `เครดิตคงเหลือ: **${fmtBaht(newBalance)}**`].join('\n'));
         await say({ content: '', embeds: [done] });
       } catch (err) {
+        message.delete().catch(() => {}); // ตรวจไม่ผ่านก็ไม่ปล่อยสลิปค้างในห้อง
+        if (slipInflightId && !slipVerified) await withWalletLock(() => wallet.endInflight(slipInflightId)).catch(() => {});
         console.error('[customer-shop] ตรวจสลิปไม่ผ่าน:', err && err.message);
         await say(`⚠️ ตรวจสลิปไม่สำเร็จ: ${(err && err.userMessage) || (err && err.message) || 'ลองใหม่อีกครั้ง'}\n-# ส่งสลิปใหม่ได้ในห้องนี้ภายในเวลาที่เหลือ หรือกดเลือกยอดใหม่`);
       } finally {
         slipBusy.delete(uid);
+        cleanupBotMsg();
       }
     } catch (err) {
       console.error('[customer-shop] slip handling error:', err);
@@ -1022,6 +1172,9 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
 
       // เตรียมออเดอร์ก่อน (อ่านอย่างเดียว ยังไม่แตะเครดิตใคร) — กันสั่งซ้ำพารามิเตอร์เดิมด้วย
       const draft = await melodyService.prepare(input.server, input.tier, input.amount, input.nick);
+      // สร้างเลขอ้างอิงออเดอร์ล่วงหน้า แล้วผูกกับการหักเครดิต — ถ้าบอทดับ จะตามออเดอร์เจอและคืนเครดิตได้
+      const clientRef = `order-${crypto.randomUUID().replace(/-/g, '')}`;
+      draft.client_reference = clientRef;
 
       const currentBalance = await withWalletLock(() => wallet.balance(userId));
       if (currentBalance < totalPrice) {
@@ -1033,7 +1186,11 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
 
       // หักเครดิตลูกค้าแบบ atomic ก่อนยิงบูสต์จริง (กันกดซ้ำ/race)
       const debitRes = await withWalletLock(() =>
-        wallet.debit(userId, totalPrice, { tier: input.tier, amount: input.amount, server: input.server }),
+        wallet.debitForOrder(userId, totalPrice, clientRef, {
+          tier: input.tier,
+          qty: input.amount,
+          server: input.server,
+        }),
       );
       if (!debitRes.ok) {
         await interaction.editReply('⛔ เครดิตไม่พอ (ยอดเปลี่ยนไประหว่างตรวจสอบ) ลองใหม่อีกครั้ง');
@@ -1050,6 +1207,12 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
         guildIcon: guildInfo.icon,
       };
       const statusMsg = await postStatus({ content: '', embeds: [buildStatusEmbed({ ...view, state: 'processing' })] });
+      if (statusMsg) {
+        // จำที่อยู่หน้าสถานะไว้ เผื่อบอทดับแล้วต้องอัปเดตผลให้ตอนกู้ออเดอร์
+        await withWalletLock(() =>
+          wallet.patchOrder(clientRef, { view, statusChannelId: statusMsg.channelId, statusMessageId: statusMsg.id }),
+        ).catch(() => {});
+      }
 
       if (statusMsg) {
         const ack = new EmbedBuilder()
@@ -1071,14 +1234,101 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
           .editReply({ content: '', embeds: [buildStatusEmbed({ ...view, state: 'processing' })] })
           .catch(() => {});
       }
-      runCustomerOrder({ userId, draft, totalPrice, amount: input.amount, view, statusMsg, interaction });
+      runCustomerOrder({ userId, draft, ref: clientRef, totalPrice, amount: input.amount, view, statusMsg, interaction }).catch(async (err) => {
+        // หักเครดิตแล้วแต่ขั้นตอนหลังบ้านพัง -> ห้ามเงียบ แจ้งแอดมินให้ตรวจ/คืนเครดิตมือ
+        console.error('[customer-shop] ⚠️ runCustomerOrder พังหลังหักเครดิต:', err);
+        await notifyAdmins(0xed4245, '🚨 ออเดอร์ลูกค้าพังหลังหักเครดิต (ต้องตรวจมือ)', [
+          `**อ้างอิง:** \`${clientRef}\` (ออเดอร์ยังค้างในสมุด จะถูกตรวจ/คืนเครดิตอัตโนมัติตอนบอทเริ่มใหม่)`,
+          `**ผู้สั่ง:** <@${userId}>`,
+          `**ยอดที่หัก:** ${fmtBaht(totalPrice)}`,
+          `**สาเหตุ:** ${(err && err.message) || 'ไม่ทราบ'}`,
+        ]);
+        interaction
+          .followUp({ content: `⚠️ เกิดข้อผิดพลาดระหว่างดำเนินการ ยอดที่หัก ${fmtBaht(totalPrice)} ถูกบันทึกไว้แล้ว กรุณาติดต่อแอดมิน`, ephemeral: true })
+          .catch(() => {});
+      });
     } catch (err) {
       await interaction.editReply(`⚠️ ${safeErr(err)}`).catch(() => {});
     }
   }
 
+  // ---------- คำนวณยอดคืนจากผลลัพธ์สุดท้ายของ Melody ----------
+  function computeRefund(snap, totalPrice, amount) {
+    const requested = snap.boosts_requested ?? amount;
+    const applied = snap.boosts_applied ?? 0;
+    const complete = snap.status === 'completed' || (requested > 0 && applied >= requested);
+
+    let refundAmount = 0;
+    let refundNote;
+    if (complete) {
+      refundNote = 'บูสต์ส่งครบตามจำนวนที่สั่ง ไม่มีการคืนเครดิต';
+    } else if (snap.failure_reason && NO_REFUND_FAILURE_REASONS.has(snap.failure_reason)) {
+      refundNote = 'ไม่สามารถบูสต์เซิร์ฟเวอร์นี้ได้ครบ (ตรวจสอบว่าลิงก์เชิญยังไม่หมดอายุและใช้ได้ไม่จำกัด) ตามเงื่อนไขของร้านจะไม่คืนเครดิตของออเดอร์นี้ หากมีข้อสงสัยติดต่อแอดมิน';
+    } else if (snap.price_charged && snap.refunded !== null && snap.refunded > 0) {
+      const ratio = Math.min(1, snap.refunded / snap.price_charged);
+      refundAmount = Math.round(totalPrice * ratio * 100) / 100;
+      refundNote = 'คืนเครดิตตามสัดส่วนบูสต์ที่ไม่สำเร็จ';
+    } else if (requested > 0 && applied < requested) {
+      const ratio = (requested - applied) / requested;
+      refundAmount = Math.round(totalPrice * ratio * 100) / 100;
+      refundNote = `บูสต์ไม่ครบจำนวน คืนเครดิตตามสัดส่วนที่ขาด (${applied}/${requested})`;
+    } else {
+      refundNote = 'ไม่มีส่วนที่ต้องคืน';
+    }
+    return { requested, applied, complete, refundAmount, refundNote };
+  }
+
+  // ---------- สรุปออเดอร์ที่ทราบผลสุดท้ายแล้ว: คืนเครดิต + ปิดออเดอร์ (atomic) + แจ้งลูกค้า/แอดมิน ----------
+  // ใช้ร่วมกันทั้งตอนออเดอร์จบปกติ และตอนกู้ออเดอร์หลังบอทดับ — เรียกซ้ำปลอดภัย (ปิดไปแล้วจะไม่คืนซ้ำ)
+  async function finalizeOrder({ userId, ref, snap, totalPrice, amount, updateStatus, tellUser, recovered = false }) {
+    const { requested, applied, complete, refundAmount, refundNote } = computeRefund(snap, totalPrice, amount);
+    const res = await withWalletLock(() => wallet.settleOrder(ref, refundAmount, { reason: 'order_shortfall' }));
+    if (!res.settled) {
+      console.log(`[customer-shop] ออเดอร์ ${ref} ถูกสรุปไปแล้ว ข้าม`);
+      return;
+    }
+    const refunded = res.refunded;
+    const newBal = refunded > 0 ? res.balance : null;
+
+    const state = complete ? 'completed' : applied > 0 ? 'partial' : 'failed';
+    await updateStatus(state, { applied, requested, before: snap.boosts_before ?? null, after: snap.boosts_after ?? null });
+    refreshShops('มีออเดอร์บูสต์เสร็จ').catch(() => {}); // หน้าร้านอัปเดตสต็อก/ยอดบูสต์ทันที
+
+    // ข้อความถึงลูกค้า (เห็นเฉพาะคนสั่ง) — ไม่มีข้อมูลเทคนิค
+    const statusLabel = { completed: 'สำเร็จ', partial: 'สำเร็จบางส่วน', failed: 'ไม่สำเร็จ' }[state];
+    const color = { completed: 0x57f287, partial: 0xe67e22, failed: 0xed4245 }[state];
+    const customerEmbed = new EmbedBuilder()
+      .setColor(color)
+      .setDescription(
+        [
+          `# ${{ completed: '✅', partial: '⚠️', failed: '❌' }[state]} บูสต์เสร็จสิ้น`,
+          `## ผล: **${statusLabel}**`,
+          `บูสต์สำเร็จ: **${applied}/${requested}**`,
+          refundNote,
+          refunded > 0 ? `คืนเครดิต: **${fmtBaht(refunded)}** (คงเหลือ: **${fmtBaht(newBal)}**)` : '',
+        ].filter(Boolean).join('\n'),
+      );
+    await tellUser({
+      content: recovered ? 'ℹ️ บอทเพิ่งกลับมาออนไลน์หลังสะดุด และสรุปออเดอร์ของคุณให้แล้ว' : '',
+      embeds: [customerEmbed],
+    });
+
+    // log สำหรับแอดมิน (มี client_reference)
+    await notifyAdmins(
+      color,
+      `${{ completed: '✅', partial: '⚠️', failed: '❌' }[state]} สรุปออเดอร์ลูกค้า${recovered ? ' (กู้หลังบอทเริ่มใหม่)' : ''}`,
+      [`**ผู้สั่ง:** <@${userId}>`, `**สถานะ:** ${statusLabel} (${snap.status})`],
+      [
+        { name: 'บูสต์', value: `${applied}/${requested}`, inline: true },
+        { name: 'ยอดที่หัก', value: fmtBaht(totalPrice), inline: true },
+        { name: 'คืนเครดิต', value: refunded > 0 ? fmtBaht(refunded) : 'ไม่มี', inline: true },
+        { name: 'client_reference', value: `\`${ref}\`` },
+      ],
+    );
+  }
+
   // ---------- ยิงออเดอร์จริง + คืนเครดิตตามผลลัพธ์ + อัปเดตหน้าสถานะ ----------
-  async function runCustomerOrder({ userId, draft, totalPrice, amount, view, statusMsg, interaction }) {
+  async function runCustomerOrder({ userId, draft, ref, totalPrice, amount, view, statusMsg, interaction }) {
     const updateStatus = async (state, extra = {}) => {
       const payload = { content: '', embeds: [buildStatusEmbed({ ...view, state, ...extra })] };
       try {
@@ -1088,15 +1338,32 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
         console.error('[customer-shop] แก้หน้าสถานะไม่ได้:', e && e.message);
       }
     };
-    const tell = (text) =>
-      interaction.followUp({ content: text, ephemeral: true }).catch((e) => console.error('[customer-shop] ส่งข้อความหาลูกค้าไม่ได้:', e && e.message));
+    const tellUser = (payload) =>
+      interaction.followUp({ ...payload, ephemeral: true }).catch((e) => console.error('[customer-shop] ส่งข้อความหาลูกค้าไม่ได้:', e && e.message));
+    const tell = (text) => tellUser({ content: text });
     const orderLines = () => [`**ผู้สั่ง:** <@${userId}>`, `**ยอดที่หัก:** ${fmtBaht(totalPrice)}`];
+    const markReview = () => withWalletLock(() => wallet.patchOrder(ref, { status: 'review' })).catch(() => {});
 
     let record;
     try {
       record = await melodyService.submit(draft);
     } catch (err) {
       console.error('[customer-shop] submit error:', err && err.message);
+      // ไม่มีออเดอร์ในไฟล์ประวัติ = ยังไม่เคยยิง POST แน่นอน -> ปลอดภัยที่จะคืนเครดิตเต็ม
+      let notSent = false;
+      try {
+        notSent = !melodyService.get(ref);
+      } catch {
+        notSent = false;
+      }
+      if (notSent) {
+        const res = await withWalletLock(() => wallet.settleOrder(ref, totalPrice, { reason: 'not_submitted' }));
+        await updateStatus('failed', { applied: 0 });
+        await tell(`❌ ส่งออเดอร์ไม่สำเร็จ ระบบคืนเครดิตเต็มจำนวน **${fmtBaht(totalPrice)}** แล้ว (คงเหลือ: **${fmtBaht(res.balance)}**) ลองสั่งใหม่อีกครั้งได้เลย`);
+        await notifyAdmins(0xe67e22, '⚠️ ออเดอร์ลูกค้า: ส่งไม่ได้ (คืนเครดิตเต็มแล้ว)', [...orderLines(), `**สาเหตุ:** ${(err && err.message) || 'ไม่ทราบ'}`]);
+        return;
+      }
+      await markReview();
       await updateStatus('review');
       await tell(`⚠️ เกิดข้อผิดพลาดระหว่างสั่งออเดอร์ ออเดอร์ของคุณถูกบันทึกไว้แล้ว ยอดที่หัก ${fmtBaht(totalPrice)} ยังไม่ถูกคืนจนกว่าแอดมินจะตรวจสอบ กรุณาติดต่อแอดมิน`);
       await notifyAdmins(0xe67e22, '⚠️ ออเดอร์ลูกค้า: ส่งคำสั่งไม่สำเร็จ', [...orderLines(), `**สาเหตุ:** ${(err && err.message) || 'ไม่ทราบ'}`]);
@@ -1105,15 +1372,16 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
     const refField = { name: 'client_reference', value: `\`${record.client_reference}\`` };
 
     if (record.state === 'rejected') {
-      // ระบบปฏิเสธคำขอ ไม่เกิดออเดอร์จริง -> คืนเครดิตลูกค้าเต็มจำนวน
-      const newBal = await withWalletLock(() => wallet.refund(userId, totalPrice, { reason: 'rejected', ref: record.client_reference }));
+      // ระบบปฏิเสธคำขอ ไม่เกิดออเดอร์จริง -> คืนเครดิตลูกค้าเต็มจำนวน (และปิดออเดอร์ในสมุด)
+      const res = await withWalletLock(() => wallet.settleOrder(ref, totalPrice, { reason: 'rejected' }));
       await updateStatus('failed', { applied: 0 });
-      await tell(`❌ ออเดอร์ไม่สำเร็จ ระบบคืนเครดิตเต็มจำนวน **${fmtBaht(totalPrice)}** แล้ว (คงเหลือ: **${fmtBaht(newBal)}**)\nตรวจสอบว่าลิงก์เชิญยังไม่หมดอายุและใช้ได้ไม่จำกัด แล้วลองใหม่อีกครั้ง`);
+      await tell(`❌ ออเดอร์ไม่สำเร็จ ระบบคืนเครดิตเต็มจำนวน **${fmtBaht(totalPrice)}** แล้ว (คงเหลือ: **${fmtBaht(res.balance)}**)\nตรวจสอบว่าลิงก์เชิญยังไม่หมดอายุและใช้ได้ไม่จำกัด แล้วลองใหม่อีกครั้ง`);
       await notifyAdmins(0xed4245, '❌ ออเดอร์ลูกค้าถูกปฏิเสธ (คืนเครดิตเต็มแล้ว)', [...orderLines(), `**หมายเหตุ:** ${record.note || '-'}`], [refField]);
       return;
     }
 
     const reviewNotice = async (title, why) => {
+      await markReview();
       await updateStatus('review');
       await tell(`🕒 ออเดอร์ของคุณอยู่ระหว่างตรวจสอบ ยอดที่หัก ${fmtBaht(totalPrice)} จะยังไม่ถูกคืนจนกว่าจะทราบผล กรุณาติดต่อแอดมิน`);
       await notifyAdmins(0xfee75c, title, [...orderLines(), `**รายละเอียด:** ${why}`, 'ติดตามด้วย `!boosttrack <client_reference>`'], [refField]);
@@ -1149,70 +1417,159 @@ function setupCustomerShop(discordClient, melodyService, options = {}) {
       await reviewNotice('⚠️ ออเดอร์ลูกค้า: ไม่พบผลลัพธ์', 'ไม่มี snapshot');
       return;
     }
+    await finalizeOrder({ userId, ref, snap, totalPrice, amount, updateStatus, tellUser });
+  }
 
-    const requested = snap.boosts_requested ?? amount;
-    const applied = snap.boosts_applied ?? 0;
-    const complete = snap.status === 'completed' || (requested > 0 && applied >= requested);
+  // ====================== กู้รายการค้างหลังบอทดับ/รีสตาร์ท ======================
+  async function dmUser(userId, payload) {
+    try {
+      const u = await discordClient.users.fetch(userId);
+      await u.send(payload);
+    } catch (e) {
+      console.error(`[customer-shop] ส่ง DM หาลูกค้า ${userId} ไม่ได้:`, e && e.message);
+    }
+  }
 
-    let refundAmount = 0;
-    let refundNote;
-    if (complete) {
-      refundNote = 'บูสต์ส่งครบตามจำนวนที่สั่ง ไม่มีการคืนเครดิต';
-    } else if (snap.failure_reason && NO_REFUND_FAILURE_REASONS.has(snap.failure_reason)) {
-      refundNote = 'ไม่สามารถบูสต์เซิร์ฟเวอร์นี้ได้ครบ (ตรวจสอบว่าลิงก์เชิญยังไม่หมดอายุและใช้ได้ไม่จำกัด) ตามเงื่อนไขของร้านจะไม่คืนเครดิตของออเดอร์นี้ หากมีข้อสงสัยติดต่อแอดมิน';
-    } else if (snap.price_charged && snap.refunded !== null && snap.refunded > 0) {
-      const ratio = Math.min(1, snap.refunded / snap.price_charged);
-      refundAmount = Math.round(totalPrice * ratio * 100) / 100;
-      refundNote = 'คืนเครดิตตามสัดส่วนบูสต์ที่ไม่สำเร็จ';
-    } else if (requested > 0 && applied < requested) {
-      const ratio = (requested - applied) / requested;
-      refundAmount = Math.round(totalPrice * ratio * 100) / 100;
-      refundNote = `บูสต์ไม่ครบจำนวน คืนเครดิตตามสัดส่วนที่ขาด (${applied}/${requested})`;
-    } else {
-      refundNote = 'ไม่มีส่วนที่ต้องคืน';
+  const makeStatusUpdater = (order) => async (state, extra = {}) => {
+    if (!order.statusChannelId || !order.statusMessageId || !order.view) return;
+    try {
+      const ch = await discordClient.channels.fetch(order.statusChannelId);
+      const msg = await ch.messages.fetch(order.statusMessageId);
+      await msg.edit({ content: '', embeds: [buildStatusEmbed({ ...order.view, state, ...extra })] });
+    } catch (e) {
+      console.error('[customer-shop] กู้หน้าสถานะไม่ได้:', e && e.message);
+    }
+  };
+
+  // การเติมเครดิตที่ค้าง (รับซอง/ตรวจสลิป) จากรอบก่อนที่บอทดับ
+  async function recoverInflight(f) {
+    const known = (f.status === 'redeemed' || f.status === 'verified') && typeof f.amount === 'number' && f.amount > 0;
+    const transRef = f.kind === 'truemoney' ? (f.code ? `truemoney:${f.code}` : null) : f.transRef || null;
+    if (known && transRef) {
+      try {
+        const newBal = await creditWithRetry(f.userId, f.amount, {
+          transRef,
+          source: f.kind === 'truemoney' ? 'truemoney' : 'slipok',
+          from: f.ownerName,
+          inflightId: f.id,
+          recovered: true,
+        });
+        logTopup({ userId: f.userId, amount: f.amount, balance: newBal, source: f.kind === 'truemoney' ? 'truemoney' : 'slipok', from: f.ownerName, transRef, recovered: true });
+        await dmUser(f.userId, { content: `✅ บอทเพิ่งกลับมาออนไลน์ และเติมเครดิตที่ค้างอยู่ให้แล้ว **+${fmtBaht(f.amount)}** (คงเหลือ: **${fmtBaht(newBal)}**)` });
+        await notifyAdmins(0x57f287, '✅ กู้การเติมเครดิตที่ค้างสำเร็จ', [`**ลูกค้า:** <@${f.userId}>`, `**ช่องทาง:** ${f.kind}`, `**ยอด:** ${fmtBaht(f.amount)}`]);
+      } catch (e) {
+        if (e && e.code === 'DUPLICATE_REF') {
+          await withWalletLock(() => wallet.endInflight(f.id)).catch(() => {}); // เติมไปแล้ว แค่ปิดรายการ
+          return;
+        }
+        throw e; // เติมไม่ได้ -> คงรายการไว้ ลองใหม่รอบหน้า
+      }
+      return;
+    }
+    // ไม่ทราบผล (บอทดับก่อนรู้ว่าเงินเข้าหรือยัง) -> ให้คนตรวจ
+    await notifyAdmins(0xe67e22, '⚠️ มีการเติมเครดิตค้างตอนบอทดับ (ต้องตรวจมือ)', [
+      `**ลูกค้า:** <@${f.userId}>`,
+      `**ช่องทาง:** ${f.kind === 'truemoney' ? 'ซอง TrueMoney' : 'พร้อมเพย์ (สลิป)'}`,
+      f.code ? `**โค้ดซอง:** \`${f.code}\`` : `**ยอดที่เลือก:** ${fmtBaht(f.amount || 0)}`,
+      `**เริ่มเมื่อ:** ${f.startedAt}`,
+      'ตรวจบัญชีรับเงิน/TrueMoney ร้านว่าเงินเข้าไหม ถ้าเข้าแล้วให้เติมด้วย `!addcredit`',
+    ]);
+    await dmUser(f.userId, { content: 'ℹ️ ระบบสะดุดระหว่างที่คุณเติมเครดิต ถ้าเงินถูกหักแล้วแต่เครดิตไม่เข้า กรุณาติดต่อแอดมินพร้อมหลักฐาน (สลิป/ลิงก์ซอง)' });
+    await withWalletLock(() => wallet.endInflight(f.id)).catch(() => {});
+  }
+
+  // ออเดอร์ที่หักเครดิตแล้วแต่ยังไม่สรุป
+  async function recoverOrder(o) {
+    const ref = o.ref;
+    const userId = o.userId;
+    const totalPrice = o.charged;
+    const amount = o.qty;
+    const updateStatus = makeStatusUpdater(o);
+    const tellUser = (payload) => dmUser(userId, payload);
+    const lines = [`**ผู้สั่ง:** <@${userId}>`, `**ยอดที่หัก:** ${fmtBaht(totalPrice)}`, `**อ้างอิง:** \`${ref}\``];
+
+    const settleFull = async (why, note) => {
+      const res = await withWalletLock(() => wallet.settleOrder(ref, totalPrice, { reason: why }));
+      if (!res.settled) return;
+      await updateStatus('failed', { applied: 0 });
+      await tellUser({ content: `ℹ️ บอทเพิ่งกลับมาออนไลน์หลังสะดุด ออเดอร์ของคุณไม่ได้ถูกดำเนินการ ระบบคืนเครดิตเต็มจำนวน **${fmtBaht(totalPrice)}** แล้ว (คงเหลือ: **${fmtBaht(res.balance)}**) สั่งใหม่ได้เลย` });
+      await notifyAdmins(0xe67e22, '♻️ กู้ออเดอร์หลังบอทเริ่มใหม่: คืนเครดิตเต็ม', [...lines, `**เหตุผล:** ${note}`]);
+    };
+    const needsReview = async (why) => {
+      await withWalletLock(() => wallet.patchOrder(ref, { status: 'review' })).catch(() => {});
+      await updateStatus('review');
+      await dmUser(userId, { content: `🕒 ออเดอร์ของคุณยังไม่ทราบผลหลังบอทสะดุด ยอดที่หัก ${fmtBaht(totalPrice)} จะยังไม่ถูกคืนจนกว่าจะทราบผล กรุณาติดต่อแอดมิน` });
+      await notifyAdmins(0xfee75c, '🕒 กู้ออเดอร์หลังบอทเริ่มใหม่: ยังไม่ทราบผล (ต้องตรวจมือ)', [...lines, `**รายละเอียด:** ${why}`, 'ติดตามด้วย `!boosttrack <client_reference>`']);
+    };
+
+    let rec = null;
+    try {
+      rec = melodyService.get(ref);
+    } catch (e) {
+      await needsReview(`อ่านไฟล์ประวัติออเดอร์ไม่ได้: ${e.message}`);
+      return;
+    }
+    // ไม่มีออเดอร์ในไฟล์ประวัติ = บอทดับก่อนยิง POST -> ไม่เกิดออเดอร์จริง คืนเต็ม
+    if (!rec) return settleFull('recovered_not_submitted', 'บอทดับก่อนส่งออเดอร์ (ไม่มีออเดอร์จริง)');
+    if (rec.state === 'rejected') return settleFull('recovered_rejected', rec.note || 'ระบบปฏิเสธออเดอร์');
+
+    if (rec.state === 'final' && rec.last_snapshot) {
+      return finalizeOrder({ userId, ref, snap: rec.last_snapshot, totalPrice, amount, updateStatus, tellUser, recovered: true });
     }
 
-    let newBal = null;
-    if (refundAmount > 0) {
-      newBal = await withWalletLock(() => wallet.refund(userId, refundAmount, { reason: 'order_shortfall', ref: record.client_reference }));
+    if (['posting', 'unconfirmed', 'tracking', 'pending_review'].includes(rec.state)) {
+      if (melodyService.isTracking(ref)) return;
+      let final;
+      try {
+        final = await melodyService.track(ref);
+      } catch (e) {
+        await needsReview(`ติดตามผลไม่สำเร็จ: ${(e && e.message) || 'ไม่ทราบ'}`);
+        return;
+      }
+      if (final.state === 'rejected') return settleFull('recovered_rejected', final.note || 'ระบบปฏิเสธออเดอร์');
+      if (final.state === 'final' && final.last_snapshot) {
+        return finalizeOrder({ userId, ref, snap: final.last_snapshot, totalPrice, amount, updateStatus, tellUser, recovered: true });
+      }
+      await needsReview(final.note || `สถานะ ${final.state}`);
+      return;
     }
+    await needsReview(`สถานะออเดอร์ไม่คาดคิด: ${rec.state}`);
+  }
 
-    const state = complete ? 'completed' : applied > 0 ? 'partial' : 'failed';
-    await updateStatus(state, { applied, requested, before: snap.boosts_before ?? null, after: snap.boosts_after ?? null });
-    refreshShops('มีออเดอร์บูสต์เสร็จ').catch(() => {}); // หน้าร้านอัปเดตสต็อก/ยอดบูสต์ทันที
-
-    // ข้อความถึงลูกค้า (เห็นเฉพาะคนสั่ง) — ไม่มีข้อมูลเทคนิค
-    const statusLabel = { completed: 'สำเร็จ', partial: 'สำเร็จบางส่วน', failed: 'ไม่สำเร็จ' }[state];
-    const color = { completed: 0x57f287, partial: 0xe67e22, failed: 0xed4245 }[state];
-    const customerEmbed = new EmbedBuilder()
-      .setColor(color)
-      .setDescription(
-        [
-          `# ${{ completed: '✅', partial: '⚠️', failed: '❌' }[state]} บูสต์เสร็จสิ้น`,
-          `## ผล: **${statusLabel}**`,
-          `บูสต์สำเร็จ: **${applied}/${requested}**`,
-          refundNote,
-          refundAmount > 0 ? `คืนเครดิต: **${fmtBaht(refundAmount)}** (คงเหลือ: **${fmtBaht(newBal)}**)` : '',
-        ].filter(Boolean).join('\n'),
-      );
-    await interaction.followUp({ embeds: [customerEmbed], ephemeral: true }).catch((err) => console.error('[customer-shop] ส่งผลให้ลูกค้าไม่ได้:', err && err.message));
-
-    // log สำหรับแอดมิน (มี client_reference)
-    await notifyAdmins(
-      color,
-      `${{ completed: '✅', partial: '⚠️', failed: '❌' }[state]} สรุปออเดอร์ลูกค้า`,
-      [`**ผู้สั่ง:** <@${userId}>`, `**สถานะ:** ${statusLabel} (${snap.status})`],
-      [
-        { name: 'บูสต์', value: `${applied}/${requested}`, inline: true },
-        { name: 'ยอดที่หัก', value: fmtBaht(totalPrice), inline: true },
-        { name: 'คืนเครดิต', value: refundAmount > 0 ? fmtBaht(refundAmount) : 'ไม่มี', inline: true },
-        refField,
-      ],
+  async function recoverOnStartup() {
+    let inflight = [];
+    let orders = [];
+    try {
+      inflight = (await withWalletLock(() => wallet.listInflight())).filter((x) => x.startedAt < bootTime);
+      orders = (await withWalletLock(() => wallet.listOrders())).filter((x) => x.createdAt < bootTime);
+    } catch (e) {
+      console.error('[customer-shop] 🚨 อ่านรายการค้างไม่ได้:', e.message);
+      return;
+    }
+    if (!inflight.length && !orders.length) return;
+    console.log(`[customer-shop] พบรายการค้างจากรอบก่อน: เติมเครดิต ${inflight.length}, ออเดอร์ ${orders.length} — กำลังกู้`);
+    for (const f of inflight) {
+      await recoverInflight(f).catch((e) => console.error(`[customer-shop] กู้รายการเติมเครดิต ${f.id} ไม่สำเร็จ:`, e && e.message));
+    }
+    await Promise.all(
+      orders.map((o) => recoverOrder(o).catch((e) => console.error(`[customer-shop] กู้ออเดอร์ ${o.ref} ไม่สำเร็จ:`, e && e.message))),
     );
   }
 
+  let recoveryStarted = false;
+  const startRecovery = () => {
+    if (recoveryStarted) return;
+    recoveryStarted = true;
+    recoverOnStartup().catch((e) => console.error('[customer-shop] กู้รายการค้างพลาด:', e));
+  };
+  if (typeof discordClient.isReady === 'function' && discordClient.isReady()) startRecovery();
+  else {
+    discordClient.once('ready', startRecovery);
+    discordClient.once('clientReady', startRecovery);
+  }
+
   console.log(`[customer-shop] พร้อมใช้งาน (ไฟล์กระเป๋าเครดิต: ${walletFile}, ราคา 1m=${price1m}บาท/ลูก 3m=${price3m}บาท/ลูก)`);
-  return { wallet, CUSTOMER_PRICE, postShop };
+  return { wallet, CUSTOMER_PRICE, postShop, drain: () => walletChain };
 }
 
 module.exports = { setupCustomerShop, validateOrderInput };

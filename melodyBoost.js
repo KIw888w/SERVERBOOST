@@ -281,7 +281,22 @@ class OrderStore {
     try {
       data = JSON.parse(fs.readFileSync(this.file, 'utf8'));
     } catch {
-      throw new StoreError(`อ่านไฟล์ประวัติออเดอร์ไม่ได้: ${this.file} — ไม่ได้ลบหรือเขียนทับไฟล์ ตรวจสอบ/กู้ไฟล์ก่อนใช้งานต่อ`);
+      // ไฟล์หลักเสีย -> ลองกู้จาก .bak (เก็บไฟล์เสียไว้ ไม่ลบ)
+      const bakFile = `${this.file}.bak`;
+      let bak = null;
+      try {
+        bak = JSON.parse(fs.readFileSync(bakFile, 'utf8'));
+      } catch {
+        /* ไม่มี/ใช้ไม่ได้ */
+      }
+      if (!bak || typeof bak.orders !== 'object' || bak.orders === null || Array.isArray(bak.orders)) {
+        throw new StoreError(`อ่านไฟล์ประวัติออเดอร์ไม่ได้: ${this.file} — ไม่ได้ลบหรือเขียนทับไฟล์ ตรวจสอบ/กู้ไฟล์ก่อนใช้งานต่อ`);
+      }
+      const corruptCopy = `${this.file}.corrupt-${Date.now()}`;
+      try { fs.renameSync(this.file, corruptCopy); } catch { /* ignore */ }
+      console.error(`[melody-boost] ⚠️ ไฟล์ประวัติออเดอร์เสีย — กู้จาก ${bakFile} แล้ว (ไฟล์เสียเก็บไว้ที่ ${corruptCopy})`);
+      this._write(bak, true);
+      data = bak;
     }
     if (!data || typeof data.orders !== 'object' || data.orders === null || Array.isArray(data.orders)) {
       throw new StoreError(`รูปแบบไฟล์ประวัติออเดอร์ไม่ถูกต้อง: ${this.file}`);
@@ -299,7 +314,7 @@ class OrderStore {
     data.orders[record.client_reference] = record;
     this._write(data);
   }
-  _write(data) {
+  _write(data, skipBackup = false) {
     const dir = path.dirname(this.file);
     const tmp = path.join(dir, `.orders-${crypto.randomBytes(6).toString('hex')}.tmp`);
     try {
@@ -310,6 +325,13 @@ class OrderStore {
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
+      }
+      if (!skipBackup && fs.existsSync(this.file)) {
+        try {
+          fs.copyFileSync(this.file, `${this.file}.bak`); // เก็บเวอร์ชันก่อนหน้าไว้กู้
+        } catch (e) {
+          console.error('[melody-boost] สำรอง .bak ไม่สำเร็จ (ยังบันทึกต่อ):', e && e.message);
+        }
       }
       fs.renameSync(tmp, this.file); // atomic
     } catch (err) {
@@ -435,7 +457,11 @@ function createService(client, store, opts = {}) {
       const t = nowIso();
       const req = draft.request;
       const record = {
-        client_reference: `order-${crypto.randomUUID().replace(/-/g, '')}`,
+        // ถ้าผู้เรียกสร้างเลขอ้างอิงไว้ล่วงหน้า (customerShop สร้างก่อนหักเครดิต เพื่อกู้ออเดอร์ได้ตอนบอทดับ) ให้ใช้เลขนั้น
+        client_reference:
+          typeof draft.client_reference === 'string' && /^order-[a-f0-9]{32}$/.test(draft.client_reference)
+            ? draft.client_reference
+            : `order-${crypto.randomUUID().replace(/-/g, '')}`,
         server: req.server,
         tier: req.tier,
         amount: req.amount,
