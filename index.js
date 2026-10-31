@@ -55,6 +55,12 @@ const shutdown = async (sig) => {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
+// แสดง IP/ประเทศของโฮสต์ใน console ตอนเริ่ม (ไว้ดูว่า TrueMoney จะบล็อกไหม — ต้องเป็นไทยถึงจะรับซองได้ปกติ)
+fetch('https://ipinfo.io/json', { signal: AbortSignal.timeout(8000) })
+  .then((r) => r.json())
+  .then((j) => console.log(`[host] IP: ${j.ip} | ประเทศ: ${j.country} | ผู้ให้บริการ: ${j.org}`))
+  .catch((e) => console.log('[host] เช็ก IP ไม่ได้:', e.message));
+
 process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err));
 
 client.login(token).catch((err) => {

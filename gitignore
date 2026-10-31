@@ -1,0 +1,14 @@
+.env
+node_modules/
+# ไฟล์ข้อมูลเครดิตลูกค้า/ออเดอร์ — ห้ามอัปขึ้น GitHub (ไม่งั้นรีดีพลอยแล้วยอดเครดิตย้อนกลับเป็นของเก่า)
+customer_wallet.json
+customer_wallet.json.bak
+customer_wallet.json.corrupt-*
+wallet_backups/
+melody_orders.json
+melody_orders.json.bak
+melody_orders.json.corrupt-*
+shop_messages.json
+stock_alert_state.json
+.wallet-*.tmp
+.orders-*.tmp
